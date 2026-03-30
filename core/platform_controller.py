@@ -93,12 +93,21 @@ class PlatformController:
         self._smooth_pitch = 0.0
         self._smoothing = 0.3
 
-        # ── Поток детекции ──
+        # ── Потоки ──
+        # Поток детекции YOLO26
         self._detection_thread: threading.Thread = None
         self._latest_detections = []
         self._detection_lock = threading.Lock()
         self._detection_frame = None
         self._new_frame_event = threading.Event()
+
+        # Поток управления моторами (100 Гц, высший приоритет)
+        self._motor_thread: threading.Thread = None
+        self._motor_lock = threading.Lock()
+
+        # Последний кадр для HUD (потокобезопасно)
+        self._hud_frame = None
+        self._hud_frame_lock = threading.Lock()
 
         # Обработчики сигналов
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -300,30 +309,40 @@ class PlatformController:
     # ════════════════════════════════════════════════════════
 
     def run(self):
-        """Запустить главный цикл управления."""
+        """
+        Запустить систему с полной многопоточностью.
+
+        Архитектура потоков:
+          1. Camera Thread    — захват кадров (уже в camera_driver)
+          2. Detection Thread — YOLO26 + BoT-SORT трекинг
+          3. LRF Thread       — опрос дальномера (уже в rangefinder_driver)
+          4. Motor Thread     — управление моторами MIT Mode (100 Гц)
+          5. Main Thread      — джойстик + баллистика + HUD (30 Гц)
+
+        Motor Thread работает на 100 Гц независимо от HUD,
+        обеспечивая стабильное управление даже при тяжёлом рендере.
+        """
         if not self._sm.is_operational:
             logger.error("Платформа не в рабочем состоянии, запуск невозможен")
             return
 
         self._running = True
         self._start_time = time.time()
-        dt = 1.0 / self._cfg.system.main_loop_hz
 
-        # Запуск потока детекции
+        # Запуск фоновых потоков
         self._start_detection_thread()
+        self._start_motor_thread()
 
-        logger.info(f"Главный цикл запущен ({self._cfg.system.main_loop_hz} Гц)")
-        logger.info("Управление:")
-        logger.info(f"  Стик          → наведение")
-        logger.info(f"  Колёсико      → зум")
-        logger.info(f"  Кнопка {self._cfg.joystick.button_mode_toggle}      → переключение РУЧНОЙ/АВТО")
-        logger.info(f"  Кнопка {self._cfg.joystick.button_lock_target}      → захват/сброс цели")
-        logger.info(f"  Триггер       → замер дальности")
-        logger.info(f"  Кнопка {self._cfg.joystick.button_estop}      → АВАРИЙНАЯ ОСТАНОВКА")
-        logger.info(f"  Ctrl+C        → завершение")
+        logger.info("Многопоточная система запущена:")
+        logger.info("  [1] Camera Thread    — захват кадров (30 FPS)")
+        logger.info("  [2] Detection Thread — YOLO26 + BoT-SORT")
+        logger.info("  [3] LRF Thread       — дальномер (10 Гц)")
+        logger.info(f"  [4] Motor Thread     — MIT Mode ({self._cfg.system.motor_control_hz} Гц)")
+        logger.info(f"  [5] Main Thread      — джойстик + баллистика + HUD ({self._cfg.system.hud_fps} FPS)")
 
-        frame_counter = 0
+        hud_dt = 1.0 / self._cfg.system.hud_fps
 
+        # ── Main Thread: джойстик + детекция результаты + баллистика + HUD ──
         while self._running:
             loop_start = time.time()
 
@@ -340,7 +359,7 @@ class PlatformController:
                     if self._can_manager:
                         self._can_manager.enable_all()
                 else:
-                    self._sleep_until(loop_start, dt)
+                    self._sleep_until(loop_start, hud_dt)
                     continue
 
             # ── 3. Захват кадра ──
@@ -350,36 +369,33 @@ class PlatformController:
                 self._state.camera_fps = self._camera.fps_actual
                 self._state.zoom_level = self._camera.zoom
 
-            # ── 4. Детекция + трекинг YOLO26 BoT-SORT (в отдельном потоке) ──
+            # ── 4. Передача кадра в поток детекции ──
             if frame is not None and self._detector and self._detector.is_initialized:
-                # Передаём кадр в поток детекции (неблокирующе)
                 self._detection_frame = frame
                 self._new_frame_event.set()
 
-                # Забираем результаты из потока детекции (если есть)
+                # Забираем результаты детекции
                 with self._detection_lock:
                     if self._latest_detections:
                         self._target_mgr.update(self._latest_detections)
                         self._latest_detections = []
                         self._update_tracking_state()
 
-            # ── 5. Управление платформой ──
+            # ── 5. Управление платформой (вычисление целевых углов) ──
+            motor_dt = 1.0 / self._cfg.system.motor_control_hz
             if self._sm.is_manual:
-                self._process_manual_control(dt)
+                self._process_manual_control(motor_dt)
             elif self._sm.is_auto:
-                self._process_auto_control(dt)
+                self._process_auto_control(motor_dt)
 
-            # ── 6. Отправка команд моторам ──
-            self._send_motor_commands()
-
-            # ── 7. Управление зумом ──
+            # ── 6. Управление зумом ──
             self._process_zoom()
 
-            # ── 8. Баллистика и предсказание ──
+            # ── 7. Баллистика и предсказание ──
             if self._state.target_lock == TargetLockState.LOCKED:
                 self._update_ballistics()
 
-            # ── 9. HUD + отображение ──
+            # ── 8. HUD + отображение (30 FPS) ──
             if frame is not None and self._hud:
                 self._state.timestamp = time.time()
                 self._state.uptime_sec = time.time() - self._start_time
@@ -391,12 +407,10 @@ class PlatformController:
                     if key == 27:  # ESC
                         self._running = False
 
-            # ── 10. Тайминг ──
+            # ── 9. Тайминг (30 FPS для HUD) ──
             elapsed = time.time() - loop_start
             self._state.loop_time_ms = elapsed * 1000
-            frame_counter += 1
-
-            self._sleep_until(loop_start, dt)
+            self._sleep_until(loop_start, hud_dt)
 
         # Завершение
         self.shutdown()
@@ -723,6 +737,39 @@ class PlatformController:
     # ════════════════════════════════════════════════════════
     # Поток детекции YOLO26
     # ════════════════════════════════════════════════════════
+
+    def _start_motor_thread(self):
+        """
+        Запустить фоновый поток управления моторами (100 Гц).
+
+        Этот поток работает с ВЫСШИМ приоритетом и стабильной частотой,
+        независимо от HUD-рендера и детекции. Обеспечивает плавное
+        управление платформой даже при тяжёлой нагрузке на CPU.
+        """
+        self._motor_thread = threading.Thread(
+            target=self._motor_control_loop,
+            name="MotorControlThread",
+            daemon=True
+        )
+        self._motor_thread.start()
+        logger.info(f"Поток управления моторами запущен ({self._cfg.system.motor_control_hz} Гц)")
+
+    def _motor_control_loop(self):
+        """
+        Фоновый поток: отправка MIT Mode команд моторам на 100 Гц.
+
+        Читает целевые углы из self._target_yaw_deg / self._target_pitch_deg
+        (обновляются из Main Thread) и отправляет CAN-команды.
+        """
+        motor_dt = 1.0 / self._cfg.system.motor_control_hz
+
+        while self._running:
+            loop_start = time.time()
+
+            if self._sm.is_operational:
+                self._send_motor_commands()
+
+            self._sleep_until(loop_start, motor_dt)
 
     def _start_detection_thread(self):
         """Запустить фоновый поток детекции."""
