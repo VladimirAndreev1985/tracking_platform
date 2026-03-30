@@ -218,23 +218,73 @@ class HUDRenderer:
             self._draw_text_with_bg(frame, tid_label, (x2 - 50, y1 - 8), color, scale=0.35)
 
     def _draw_lead_point(self, frame: np.ndarray, state: SharedState):
-        """Точка перехвата (lead point)."""
+        """
+        Точка перехвата (lead point) с пульсацией.
+
+        Перекрестие пульсирует (меняет размер и яркость)
+        для привлечения внимания оператора к точке наведения.
+        """
         lx, ly = int(state.lead_point_px[0]), int(state.lead_point_px[1])
 
-        # Перекрестие точки перехвата
-        size = 12
-        cv2.line(frame, (lx - size, ly), (lx + size, ly), self._c_lead, 2)
-        cv2.line(frame, (lx, ly - size), (lx, ly + size), self._c_lead, 2)
-        cv2.circle(frame, (lx, ly), size, self._c_lead, 1)
+        # ── Пульсация ──
+        # Синусоидальное изменение размера и толщины (2 Гц)
+        pulse = math.sin(time.time() * 2.0 * math.pi * 2.0)  # -1..+1, 2 Гц
+        pulse_norm = (pulse + 1.0) / 2.0  # 0..1
 
-        # Линия от центра цели до точки перехвата
+        base_size = 14
+        size = int(base_size + pulse_norm * 6)  # 14..20 пикселей
+        thickness = 2 if pulse_norm > 0.3 else 1
+
+        # Цвет пульсирует: жёлтый ↔ белый
+        r = int(self._c_lead[0] + (255 - self._c_lead[0]) * pulse_norm * 0.5)
+        g = int(self._c_lead[1] + (255 - self._c_lead[1]) * pulse_norm * 0.5)
+        b = int(self._c_lead[2] + (255 - self._c_lead[2]) * pulse_norm * 0.5)
+        pulse_color = (min(r, 255), min(g, 255), min(b, 255))
+
+        # ── Перекрестие точки перехвата (пульсирующее) ──
+        cv2.line(frame, (lx - size, ly), (lx + size, ly), pulse_color, thickness)
+        cv2.line(frame, (lx, ly - size), (lx, ly + size), pulse_color, thickness)
+        cv2.circle(frame, (lx, ly), size, pulse_color, 1)
+
+        # Внутренний ромб (дополнительный маркер)
+        diamond_size = size // 2
+        pts = np.array([
+            [lx, ly - diamond_size],
+            [lx + diamond_size, ly],
+            [lx, ly + diamond_size],
+            [lx - diamond_size, ly]
+        ], np.int32)
+        cv2.polylines(frame, [pts], True, pulse_color, 1, cv2.LINE_AA)
+
+        # ── Линия от центра цели до точки перехвата (пунктирная) ──
         if state.target_center_px:
             tcx, tcy = int(state.target_center_px[0]), int(state.target_center_px[1])
-            cv2.line(frame, (tcx, tcy), (lx, ly), self._c_lead, 1, cv2.LINE_AA)
+            # Пунктирная линия
+            self._draw_dashed_line(frame, (tcx, tcy), (lx, ly), self._c_lead, 1, 8)
 
-        # Метка
+        # ── Метка с ToF ──
         label = f"ПЕРЕХВАТ ToF:{state.time_of_flight_sec:.2f}с"
-        self._draw_text_with_bg(frame, label, (lx + 15, ly - 5), self._c_lead, scale=0.35)
+        self._draw_text_with_bg(frame, label, (lx + 18, ly - 5), pulse_color, scale=0.35)
+
+    def _draw_dashed_line(self, frame: np.ndarray, pt1: tuple, pt2: tuple,
+                          color: tuple, thickness: int = 1, dash_length: int = 8):
+        """Нарисовать пунктирную линию."""
+        x1, y1 = pt1
+        x2, y2 = pt2
+        dist = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+        if dist < 1:
+            return
+        dx = (x2 - x1) / dist
+        dy = (y2 - y1) / dist
+        num_dashes = int(dist / (dash_length * 2))
+        for i in range(num_dashes + 1):
+            start = int(i * dash_length * 2)
+            end = min(int(start + dash_length), int(dist))
+            sx = int(x1 + dx * start)
+            sy = int(y1 + dy * start)
+            ex = int(x1 + dx * end)
+            ey = int(y1 + dy * end)
+            cv2.line(frame, (sx, sy), (ex, ey), color, thickness, cv2.LINE_AA)
 
     def _draw_trajectory(self, frame: np.ndarray, state: SharedState):
         """Предсказанная траектория (пунктирная линия)."""
