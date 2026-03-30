@@ -37,7 +37,7 @@ from drivers.joystick_driver import JoystickDriver
 from drivers.camera_driver import CameraDriver
 from drivers.rangefinder_driver import RangefinderDriver
 from perception.detector import YOLODetector
-from perception.tracker import ObjectTracker
+from perception.tracker import TargetManager
 from ui.hud_renderer import HUDRenderer
 
 try:
@@ -79,7 +79,7 @@ class PlatformController:
         self._camera: CameraDriver = None
         self._rangefinder: RangefinderDriver = None
         self._detector: YOLODetector = None
-        self._tracker: ObjectTracker = None
+        self._target_mgr: TargetManager = None
         self._autotracker: AutoTracker = None
         self._ballistics: BallisticCalculator = None
         self._predictor: TrajectoryPredictor = None
@@ -233,12 +233,7 @@ class PlatformController:
 
         # ── 6. Трекер + Автослежение + Баллистика ──
         logger.info("  [6/7] Трекер, автослежение, баллистика...")
-        trk_cfg = cfg.tracker
-        self._tracker = ObjectTracker(
-            max_age=trk_cfg.max_age,
-            min_hits=trk_cfg.min_hits,
-            iou_threshold=trk_cfg.iou_threshold,
-        )
+        self._target_mgr = TargetManager()
 
         at_cfg = cfg.autotrack
         self._autotracker = AutoTracker(
@@ -344,12 +339,12 @@ class PlatformController:
                 self._state.camera_fps = self._camera.fps_actual
                 self._state.zoom_level = self._camera.zoom
 
-            # ── 4. Детекция + трекинг (каждый 2-й кадр) ──
+            # ── 4. Детекция + трекинг YOLO26 BoT-SORT (каждый 2-й кадр) ──
             if frame is not None and self._detector and self._detector.is_initialized:
                 if frame_counter % 2 == 0:
-                    detections = self._detector.detect(frame)
-                    tracks = self._tracker.update(detections)
-                    self._update_tracking_state(tracks)
+                    detections = self._detector.detect_and_track(frame)
+                    self._target_mgr.update(detections)
+                    self._update_tracking_state()
 
             # ── 5. Управление платформой ──
             if self._sm.is_manual:
@@ -429,7 +424,7 @@ class PlatformController:
 
     def _process_auto_control(self, dt: float):
         """Автоматическое слежение за целью."""
-        locked = self._tracker.locked_track if self._tracker else None
+        locked = self._target_mgr.locked_track if self._target_mgr else None
 
         if locked is None:
             # Нет захваченной цели — переход в поиск
@@ -538,9 +533,9 @@ class PlatformController:
         elif zoom_input < -0.1:
             self._camera.zoom_out()
 
-    def _update_tracking_state(self, tracks):
+    def _update_tracking_state(self):
         """Обновить состояние трекинга в SharedState."""
-        locked = self._tracker.locked_track
+        locked = self._target_mgr.locked_track
 
         if locked:
             self._state.target_bbox = locked.bbox
@@ -555,6 +550,11 @@ class PlatformController:
 
             if self._state.target_lock == TargetLockState.LOCKED:
                 self._state.target_lock = TargetLockState.LOST
+
+            # Обновить track_id из всех треков (для HUD)
+            all_tracks = self._target_mgr.tracks
+            if all_tracks:
+                self._state.target_lock = TargetLockState.DETECTED
 
     def _update_ballistics(self):
         """Обновить баллистические расчёты."""
@@ -611,8 +611,8 @@ class PlatformController:
             self._autotracker.reset()
         elif self._sm.is_auto:
             # Автоматически захватить ближайшую цель
-            if self._tracker and not self._tracker.is_target_locked:
-                self._tracker.lock_target()
+            if self._target_mgr and not self._target_mgr.is_target_locked:
+                self._target_mgr.lock_target()
 
     def _on_estop(self):
         """Аварийная остановка."""
@@ -635,8 +635,8 @@ class PlatformController:
 
     def _on_lock_target(self):
         """Захват / сброс цели."""
-        if self._tracker:
-            self._tracker.toggle_lock()
+        if self._target_mgr:
+            self._target_mgr.toggle_lock()
 
     def _on_switch_weapon(self):
         """Переключение профиля вооружения (КОРД ↔ ПКТ)."""
