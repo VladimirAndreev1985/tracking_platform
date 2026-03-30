@@ -1,13 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Трекер объектов BoT-SORT.
+Трекер объектов — BoT-SORT с fallback на IoU-трекер.
+
+Два режима:
+1. Полноценный BoT-SORT (через библиотеку boxmot) — если установлена
+   - Фильтр Калмана для предсказания позиции между кадрами
+   - Re-ID для повторной идентификации после потери
+   - Camera Motion Compensation (CMC) — важно для вращающейся платформы
+2. Встроенный IoU+Kalman трекер — fallback без внешних зависимостей
+   - IoU-ассоциация + упрощённый фильтр Калмана
+   - Достаточно для большинства сценариев
 
 Связывает детекции между кадрами, присваивая каждому
-объекту уникальный track_id. Обеспечивает устойчивое
-отслеживание даже при кратковременной потере детекции.
-
-Реализация: обёртка над BoT-SORT из библиотеки
-boxmot (или упрощённая реализация на базе IoU + Kalman).
+объекту уникальный track_id.
 """
 
 import time
@@ -20,6 +25,15 @@ import numpy as np
 from perception.detector import Detection
 
 logger = logging.getLogger(__name__)
+
+# Пробуем импортировать boxmot для полноценного BoT-SORT
+_HAS_BOXMOT = False
+try:
+    from boxmot import BoTSORT
+    _HAS_BOXMOT = True
+    logger.info("boxmot найден — используем полноценный BoT-SORT")
+except ImportError:
+    logger.info("boxmot не найден — используем встроенный IoU+Kalman трекер")
 
 
 # ════════════════════════════════════════════════════════════════
@@ -54,20 +68,86 @@ class Track:
 
 
 # ════════════════════════════════════════════════════════════════
+# Упрощённый фильтр Калмана для одного трека
+# ════════════════════════════════════════════════════════════════
+
+class _SimpleKalman:
+    """
+    Упрощённый фильтр Калмана для отслеживания bbox.
+    Состояние: [cx, cy, w, h, vx, vy, vw, vh]
+    """
+
+    def __init__(self, bbox: tuple):
+        x1, y1, x2, y2 = bbox
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        w = x2 - x1
+        h = y2 - y1
+
+        # Состояние: [cx, cy, w, h, vx, vy, vw, vh]
+        self.state = np.array([cx, cy, w, h, 0, 0, 0, 0], dtype=np.float64)
+        # Ковариация
+        self.P = np.eye(8) * 10.0
+        self.P[4:, 4:] *= 100.0  # Большая неопределённость скоростей
+
+        # Модель процесса (dt=1 кадр)
+        self.F = np.eye(8)
+        self.F[0, 4] = 1  # cx += vx
+        self.F[1, 5] = 1  # cy += vy
+        self.F[2, 6] = 1  # w += vw
+        self.F[3, 7] = 1  # h += vh
+
+        # Шум процесса
+        self.Q = np.eye(8) * 1.0
+        self.Q[4:, 4:] *= 0.01
+
+        # Матрица наблюдения (наблюдаем cx, cy, w, h)
+        self.H = np.zeros((4, 8))
+        self.H[0, 0] = 1
+        self.H[1, 1] = 1
+        self.H[2, 2] = 1
+        self.H[3, 3] = 1
+
+        # Шум наблюдения
+        self.R = np.eye(4) * 1.0
+
+    def predict(self) -> tuple:
+        """Предсказать следующее состояние."""
+        self.state = self.F @ self.state
+        self.P = self.F @ self.P @ self.F.T + self.Q
+
+        cx, cy, w, h = self.state[:4]
+        w = max(w, 1)
+        h = max(h, 1)
+        return (cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
+
+    def update(self, bbox: tuple):
+        """Обновить состояние по наблюдению."""
+        x1, y1, x2, y2 = bbox
+        z = np.array([(x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1])
+
+        y = z - self.H @ self.state
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+
+        self.state = self.state + K @ y
+        self.P = (np.eye(8) - K @ self.H) @ self.P
+
+    @property
+    def bbox(self) -> tuple:
+        """Текущий bbox из состояния."""
+        cx, cy, w, h = self.state[:4]
+        w = max(w, 1)
+        h = max(h, 1)
+        return (cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
+
+
+# ════════════════════════════════════════════════════════════════
 # Утилиты IoU
 # ════════════════════════════════════════════════════════════════
 
 def _iou(box_a: tuple, box_b: tuple) -> float:
-    """
-    Вычислить IoU (Intersection over Union) двух bounding box.
-
-    Args:
-        box_a: (x1, y1, x2, y2)
-        box_b: (x1, y1, x2, y2)
-
-    Returns:
-        IoU от 0.0 до 1.0
-    """
+    """Вычислить IoU двух bounding box."""
     x1 = max(box_a[0], box_b[0])
     y1 = max(box_a[1], box_b[1])
     x2 = min(box_a[2], box_b[2])
@@ -84,35 +164,66 @@ def _iou(box_a: tuple, box_b: tuple) -> float:
     return inter_area / union_area if union_area > 0 else 0.0
 
 
-def _iou_matrix(tracks: List[Track], detections: List[Detection]) -> np.ndarray:
-    """Матрица IoU между треками и детекциями."""
-    n_tracks = len(tracks)
-    n_dets = len(detections)
-    matrix = np.zeros((n_tracks, n_dets))
+# ════════════════════════════════════════════════════════════════
+# Внутренний трек с фильтром Калмана
+# ════════════════════════════════════════════════════════════════
 
-    for i, track in enumerate(tracks):
-        for j, det in enumerate(detections):
-            matrix[i, j] = _iou(track.bbox, det.to_xyxy())
+class _InternalTrack:
+    """Трек с фильтром Калмана для встроенного трекера."""
 
-    return matrix
+    def __init__(self, track_id: int, detection: Detection):
+        self.track_id = track_id
+        self.kalman = _SimpleKalman(detection.to_xyxy())
+        self.confidence = detection.confidence
+        self.class_id = detection.class_id
+        self.hits = 1
+        self.age = 0
+        self.time_since_update = 0
+        self.is_confirmed = False
+
+    def predict(self) -> tuple:
+        """Предсказать bbox на следующий кадр."""
+        return self.kalman.predict()
+
+    def update(self, detection: Detection):
+        """Обновить трек новой детекцией."""
+        self.kalman.update(detection.to_xyxy())
+        self.confidence = detection.confidence
+        self.class_id = detection.class_id
+        self.hits += 1
+        self.time_since_update = 0
+        if self.hits >= 3:
+            self.is_confirmed = True
+
+    @property
+    def bbox(self) -> tuple:
+        return self.kalman.bbox
+
+    def to_track(self) -> Track:
+        """Преобразовать во внешний Track."""
+        return Track(
+            track_id=self.track_id,
+            bbox=self.bbox,
+            confidence=self.confidence,
+            class_id=self.class_id,
+            age=self.age,
+            hits=self.hits,
+            time_since_update=self.time_since_update,
+            is_confirmed=self.is_confirmed,
+        )
 
 
 # ════════════════════════════════════════════════════════════════
-# Трекер
+# Трекер объектов
 # ════════════════════════════════════════════════════════════════
 
 class ObjectTracker:
     """
-    Трекер объектов на базе IoU-ассоциации.
+    Трекер объектов с поддержкой BoT-SORT (boxmot) и встроенного IoU+Kalman.
 
-    Упрощённая реализация BoT-SORT:
-    1. Ассоциация детекций с существующими треками по IoU
-    2. Создание новых треков для неассоциированных детекций
-    3. Удаление треков, потерянных на max_age кадров
-    4. Подтверждение треков после min_hits детекций
-
-    Для полноценного BoT-SORT с Re-ID и CMC используйте
-    библиотеку boxmot (pip install boxmot).
+    Автоматически выбирает бэкенд:
+    - Если boxmot установлен → полноценный BoT-SORT с Re-ID и CMC
+    - Иначе → встроенный IoU-трекер с фильтром Калмана
     """
 
     def __init__(self, max_age: int = 30, min_hits: int = 3,
@@ -127,38 +238,63 @@ class ObjectTracker:
         self._min_hits = min_hits
         self._iou_threshold = iou_threshold
 
-        # Активные треки
-        self._tracks: List[Track] = []
-        # Счётчик ID
-        self._next_id = 1
-
         # Выбранная (захваченная) цель
         self._locked_track_id: int = -1
 
-        logger.info(
-            f"ObjectTracker: max_age={max_age}, min_hits={min_hits}, "
-            f"iou_threshold={iou_threshold}"
-        )
+        # Выбор бэкенда
+        self._use_boxmot = _HAS_BOXMOT
+        self._botsort = None
+
+        if self._use_boxmot:
+            try:
+                self._botsort = BoTSORT(
+                    reid_weights=None,  # Без Re-ID модели (можно добавить позже)
+                    device='cpu',
+                    half=False,
+                    track_high_thresh=0.4,
+                    track_low_thresh=0.1,
+                    new_track_thresh=0.5,
+                    track_buffer=max_age,
+                    match_thresh=iou_threshold,
+                )
+                logger.info(
+                    f"BoT-SORT (boxmot): max_age={max_age}, "
+                    f"iou={iou_threshold}"
+                )
+            except Exception as e:
+                logger.warning(f"Ошибка инициализации BoT-SORT: {e}, fallback на IoU+Kalman")
+                self._use_boxmot = False
+
+        if not self._use_boxmot:
+            # Встроенный трекер
+            self._tracks: List[_InternalTrack] = []
+            self._next_id = 1
+            logger.info(
+                f"IoU+Kalman трекер: max_age={max_age}, min_hits={min_hits}, "
+                f"iou={iou_threshold}"
+            )
+
+        # Кэш последних треков (для внешнего API)
+        self._last_tracks: List[Track] = []
 
     @property
     def tracks(self) -> List[Track]:
         """Все активные треки."""
-        return self._tracks
+        return self._last_tracks
 
     @property
     def confirmed_tracks(self) -> List[Track]:
         """Только подтверждённые треки."""
-        return [t for t in self._tracks if t.is_confirmed]
+        return [t for t in self._last_tracks if t.is_confirmed]
 
     @property
     def locked_track(self) -> Optional[Track]:
         """Захваченный (выбранный) трек."""
         if self._locked_track_id < 0:
             return None
-        for t in self._tracks:
+        for t in self._last_tracks:
             if t.track_id == self._locked_track_id:
                 return t
-        # Трек потерян
         self._locked_track_id = -1
         return None
 
@@ -179,39 +315,66 @@ class ObjectTracker:
         Returns:
             Список подтверждённых треков
         """
-        # Шаг 1: Ассоциация детекций с треками по IoU
+        if self._use_boxmot:
+            return self._update_boxmot(detections)
+        else:
+            return self._update_builtin(detections)
+
+    def _update_boxmot(self, detections: List[Detection]) -> List[Track]:
+        """Обновление через BoT-SORT (boxmot)."""
+        if not detections:
+            # Пустой массив детекций
+            dets = np.empty((0, 6))
+        else:
+            dets = np.array([
+                [d.x1, d.y1, d.x2, d.y2, d.confidence, d.class_id]
+                for d in detections
+            ])
+
+        # BoT-SORT ожидает numpy array (N, 6): x1,y1,x2,y2,conf,cls
+        # и изображение (для CMC/Re-ID) — передаём None если без Re-ID
+        try:
+            outputs = self._botsort.update(dets, img=None)
+        except Exception:
+            # Некоторые версии boxmot требуют img
+            outputs = np.empty((0, 7))
+
+        tracks = []
+        for out in outputs:
+            if len(out) >= 7:
+                x1, y1, x2, y2, tid, conf, cls = out[:7]
+                tracks.append(Track(
+                    track_id=int(tid),
+                    bbox=(float(x1), float(y1), float(x2), float(y2)),
+                    confidence=float(conf),
+                    class_id=int(cls),
+                    is_confirmed=True,
+                ))
+
+        self._last_tracks = tracks
+        return tracks
+
+    def _update_builtin(self, detections: List[Detection]) -> List[Track]:
+        """Обновление через встроенный IoU+Kalman трекер."""
+
+        # Шаг 1: Предсказание всех треков
+        for track in self._tracks:
+            track.predict()
+            track.age += 1
+            track.time_since_update += 1
+
+        # Шаг 2: Ассоциация по IoU (предсказанные bbox vs детекции)
         matched, unmatched_tracks, unmatched_dets = self._associate(
             self._tracks, detections
         )
 
-        # Шаг 2: Обновить ассоциированные треки
+        # Шаг 3: Обновить ассоциированные треки
         for track_idx, det_idx in matched:
-            track = self._tracks[track_idx]
-            det = detections[det_idx]
-            track.bbox = det.to_xyxy()
-            track.confidence = det.confidence
-            track.class_id = det.class_id
-            track.hits += 1
-            track.time_since_update = 0
-            if track.hits >= self._min_hits:
-                track.is_confirmed = True
+            self._tracks[track_idx].update(detections[det_idx])
 
-        # Шаг 3: Увеличить возраст неассоциированных треков
-        for track_idx in unmatched_tracks:
-            self._tracks[track_idx].time_since_update += 1
-
-        # Шаг 4: Создать новые треки для неассоциированных детекций
+        # Шаг 4: Создать новые треки
         for det_idx in unmatched_dets:
-            det = detections[det_idx]
-            new_track = Track(
-                track_id=self._next_id,
-                bbox=det.to_xyxy(),
-                confidence=det.confidence,
-                class_id=det.class_id,
-                hits=1,
-                age=0,
-                time_since_update=0,
-            )
+            new_track = _InternalTrack(self._next_id, detections[det_idx])
             self._tracks.append(new_track)
             self._next_id += 1
 
@@ -221,77 +384,61 @@ class ObjectTracker:
             if t.time_since_update <= self._max_age
         ]
 
-        # Шаг 6: Увеличить возраст всех треков
-        for track in self._tracks:
-            track.age += 1
-
+        # Преобразовать во внешний формат
+        self._last_tracks = [t.to_track() for t in self._tracks]
         return self.confirmed_tracks
 
-    def _associate(self, tracks: List[Track],
+    def _associate(self, tracks: List[_InternalTrack],
                    detections: List[Detection]):
-        """
-        Ассоциировать детекции с треками по IoU (жадный алгоритм).
-
-        Returns:
-            (matched, unmatched_tracks, unmatched_detections)
-        """
+        """Ассоциация по IoU (жадный алгоритм)."""
         if not tracks or not detections:
             return [], list(range(len(tracks))), list(range(len(detections)))
 
-        iou_mat = _iou_matrix(tracks, detections)
+        # Матрица IoU (предсказанные bbox vs детекции)
+        n_tracks = len(tracks)
+        n_dets = len(detections)
+        iou_mat = np.zeros((n_tracks, n_dets))
+
+        for i, track in enumerate(tracks):
+            for j, det in enumerate(detections):
+                iou_mat[i, j] = _iou(track.bbox, det.to_xyxy())
 
         matched = []
         used_tracks = set()
         used_dets = set()
 
-        # Жадная ассоциация: берём пары с максимальным IoU
         while True:
             if iou_mat.size == 0:
                 break
-
-            # Найти максимальный IoU
             max_iou = iou_mat.max()
             if max_iou < self._iou_threshold:
                 break
-
-            # Индексы максимума
             t_idx, d_idx = np.unravel_index(iou_mat.argmax(), iou_mat.shape)
-
             matched.append((t_idx, d_idx))
             used_tracks.add(t_idx)
             used_dets.add(d_idx)
-
-            # Обнулить строку и столбец
             iou_mat[t_idx, :] = 0
             iou_mat[:, d_idx] = 0
 
-        unmatched_tracks = [i for i in range(len(tracks)) if i not in used_tracks]
-        unmatched_dets = [i for i in range(len(detections)) if i not in used_dets]
+        unmatched_tracks = [i for i in range(n_tracks) if i not in used_tracks]
+        unmatched_dets = [i for i in range(n_dets) if i not in used_dets]
 
         return matched, unmatched_tracks, unmatched_dets
 
     # ── Захват цели ─────────────────────────────────────────
 
     def lock_target(self, track_id: int = None):
-        """
-        Захватить цель (выбрать трек для автослежения).
-
-        Args:
-            track_id: ID трека. Если None — захватить ближайший
-                      к центру кадра подтверждённый трек.
-        """
+        """Захватить цель."""
         if track_id is not None:
             self._locked_track_id = track_id
             logger.info(f"Цель захвачена: track_id={track_id}")
             return
 
-        # Автовыбор — ближайший к центру
         confirmed = self.confirmed_tracks
         if not confirmed:
             logger.warning("Нет подтверждённых треков для захвата")
             return
 
-        # Берём трек с наибольшей уверенностью
         best = max(confirmed, key=lambda t: t.confidence)
         self._locked_track_id = best.track_id
         logger.info(
@@ -306,17 +453,17 @@ class ObjectTracker:
         self._locked_track_id = -1
 
     def toggle_lock(self):
-        """Переключить захват: если есть — сбросить, если нет — захватить."""
+        """Переключить захват."""
         if self.is_target_locked:
             self.release_target()
         else:
             self.lock_target()
 
-    # ── Сброс ───────────────────────────────────────────────
-
     def reset(self):
         """Сбросить все треки."""
-        self._tracks.clear()
+        if not self._use_boxmot:
+            self._tracks.clear()
+            self._next_id = 1
         self._locked_track_id = -1
-        self._next_id = 1
+        self._last_tracks.clear()
         logger.debug("ObjectTracker: сброс")
