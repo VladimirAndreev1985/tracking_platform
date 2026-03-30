@@ -45,6 +45,7 @@ class Detection:
     y2: float                 # Правый нижний угол Y
     confidence: float         # Уверенность (0.0 .. 1.0)
     class_id: int             # ID класса COCO
+    track_id: int = -1        # ID трека (из встроенного BoT-SORT YOLO26)
 
     @property
     def center(self) -> tuple:
@@ -360,6 +361,70 @@ class YOLODetector:
         except Exception as e:
             logger.error(f"Ошибка детекции Ultralytics: {e}")
             return []
+
+    def detect_and_track(self, frame: np.ndarray) -> List[Detection]:
+        """
+        Детекция + встроенный трекинг YOLO26 (BoT-SORT).
+
+        Использует model.track() вместо model() — это даёт:
+        - Встроенный BoT-SORT с фильтром Калмана
+        - Re-ID (повторная идентификация после потери)
+        - Camera Motion Compensation (CMC)
+        - Persist=True для сохранения треков между кадрами
+
+        Каждая детекция получает track_id из YOLO26.
+
+        Args:
+            frame: BGR-кадр
+
+        Returns:
+            Список детекций с track_id (в поле class_id хранится track_id)
+        """
+        if not self._initialized or frame is None or self._use_hailo:
+            return self.detect(frame)
+
+        start = time.time()
+
+        try:
+            results = self._model.track(
+                frame,
+                conf=self._conf_threshold,
+                iou=self._nms_threshold,
+                classes=self._target_classes,
+                tracker="botsort.yaml",  # Встроенный BoT-SORT трекер YOLO26
+                persist=True,            # Сохранять треки между кадрами
+                verbose=False
+            )
+
+            detections = []
+            for result in results:
+                if result.boxes is None:
+                    continue
+                for box in result.boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                    conf = float(box.conf[0])
+                    cls_id = int(box.cls[0])
+                    # Track ID из встроенного BoT-SORT
+                    track_id = int(box.id[0]) if box.id is not None else -1
+
+                    det = Detection(
+                        x1=float(x1), y1=float(y1),
+                        x2=float(x2), y2=float(y2),
+                        confidence=conf,
+                        class_id=cls_id
+                    )
+                    # Сохраняем track_id как атрибут
+                    det.track_id = track_id
+                    detections.append(det)
+
+            self._inference_time_ms = (time.time() - start) * 1000
+            self._detection_count = len(detections)
+            return detections
+
+        except Exception as e:
+            logger.error(f"Ошибка detect_and_track: {e}")
+            # Fallback на обычную детекцию
+            return self.detect(frame)
 
     def _postprocess_yolo(self, raw_output: dict,
                           orig_w: int, orig_h: int,
