@@ -63,6 +63,13 @@ class MotorConfig:
 
 
 @dataclass
+class ParallaxConfig:
+    """Параметры параллакса камера-LRF."""
+    baseline_mm: float = 80.0
+    direction: str = "right"
+
+
+@dataclass
 class RecoilConfig:
     """Параметры компенсации отдачи."""
     enabled: bool = True
@@ -77,6 +84,8 @@ class MotorsConfig:
     """Конфигурация обоих моторов платформы."""
     horizontal: MotorConfig = field(default_factory=MotorConfig)
     vertical: MotorConfig = field(default_factory=MotorConfig)
+    parallax: ParallaxConfig = field(default_factory=ParallaxConfig)
+    boresight: list = field(default_factory=lambda: [[100, 0.0, 0.0], [300, 0.0, 0.0], [500, 0.0, 0.0]])
     recoil: RecoilConfig = field(default_factory=RecoilConfig)
 
 
@@ -371,6 +380,8 @@ def load_config(config_path: str = "config/settings.yaml") -> AppConfig:
         motors=MotorsConfig(
             horizontal=_dict_to_dataclass(MotorConfig, raw.get("motors", {}).get("horizontal")),
             vertical=_dict_to_dataclass(MotorConfig, raw.get("motors", {}).get("vertical")),
+            parallax=_dict_to_dataclass(ParallaxConfig, raw.get("motors", {}).get("parallax")),
+            boresight=raw.get("motors", {}).get("boresight", [[100, 0.0, 0.0], [300, 0.0, 0.0], [500, 0.0, 0.0]]),
             recoil=_dict_to_dataclass(RecoilConfig, raw.get("motors", {}).get("recoil")),
         ),
         camera=_dict_to_dataclass(CameraConfig, raw.get("camera")),

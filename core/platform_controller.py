@@ -20,6 +20,7 @@ import time
 import math
 import signal
 import logging
+import threading
 import sys
 import os
 
@@ -91,6 +92,13 @@ class PlatformController:
         self._smooth_yaw = 0.0
         self._smooth_pitch = 0.0
         self._smoothing = 0.3
+
+        # ── Поток детекции ──
+        self._detection_thread: threading.Thread = None
+        self._latest_detections = []
+        self._detection_lock = threading.Lock()
+        self._detection_frame = None
+        self._new_frame_event = threading.Event()
 
         # Обработчики сигналов
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -301,6 +309,9 @@ class PlatformController:
         self._start_time = time.time()
         dt = 1.0 / self._cfg.system.main_loop_hz
 
+        # Запуск потока детекции
+        self._start_detection_thread()
+
         logger.info(f"Главный цикл запущен ({self._cfg.system.main_loop_hz} Гц)")
         logger.info("Управление:")
         logger.info(f"  Стик          → наведение")
@@ -339,12 +350,18 @@ class PlatformController:
                 self._state.camera_fps = self._camera.fps_actual
                 self._state.zoom_level = self._camera.zoom
 
-            # ── 4. Детекция + трекинг YOLO26 BoT-SORT (каждый 2-й кадр) ──
+            # ── 4. Детекция + трекинг YOLO26 BoT-SORT (в отдельном потоке) ──
             if frame is not None and self._detector and self._detector.is_initialized:
-                if frame_counter % 2 == 0:
-                    detections = self._detector.detect_and_track(frame)
-                    self._target_mgr.update(detections)
-                    self._update_tracking_state()
+                # Передаём кадр в поток детекции (неблокирующе)
+                self._detection_frame = frame
+                self._new_frame_event.set()
+
+                # Забираем результаты из потока детекции (если есть)
+                with self._detection_lock:
+                    if self._latest_detections:
+                        self._target_mgr.update(self._latest_detections)
+                        self._latest_detections = []
+                        self._update_tracking_state()
 
             # ── 5. Управление платформой ──
             if self._sm.is_manual:
@@ -593,10 +610,23 @@ class PlatformController:
             self._state.bullet_energy_j = solution.energy_at_target
             self._state.mach_at_target = solution.mach_at_target
 
-            # Точка перехвата в пикселях
+            # ── Коррекция параллакса камера-LRF ──
+            par_yaw, par_pitch = self._apply_parallax_correction(distance)
+
+            # ── Коррекция boresight (пристрелка) ──
+            bs_yaw, bs_pitch = self._interpolate_boresight(distance)
+
+            # Суммарные углы упреждения с коррекциями
+            total_lead_yaw = solution.lead_yaw_deg + par_yaw + bs_yaw
+            total_lead_pitch = solution.lead_pitch_deg + par_pitch + bs_pitch
+
+            self._state.lead_yaw_deg = total_lead_yaw
+            self._state.lead_pitch_deg = total_lead_pitch
+
+            # Точка перехвата в пикселях (с коррекциями)
             if solution.is_valid and self._camera:
                 lx, ly = self._camera.angle_to_pixel(
-                    solution.lead_yaw_deg, solution.lead_pitch_deg
+                    total_lead_yaw, total_lead_pitch
                 )
                 self._state.lead_point_px = (lx, ly)
 
@@ -685,6 +715,129 @@ class PlatformController:
             cv2.destroyAllWindows()
 
         logger.info("Все подсистемы остановлены")
+
+    # ════════════════════════════════════════════════════════
+    # Утилиты
+    # ════════════════════════════════════════════════════════
+
+    # ════════════════════════════════════════════════════════
+    # Поток детекции YOLO26
+    # ════════════════════════════════════════════════════════
+
+    def _start_detection_thread(self):
+        """Запустить фоновый поток детекции."""
+        self._detection_thread = threading.Thread(
+            target=self._detection_loop,
+            name="DetectionThread",
+            daemon=True
+        )
+        self._detection_thread.start()
+        logger.info("Поток детекции YOLO26 запущен")
+
+    def _detection_loop(self):
+        """
+        Фоновый поток: детекция + трекинг YOLO26 BoT-SORT.
+        Работает параллельно с главным циклом, не блокирует моторы.
+        """
+        while self._running:
+            # Ждём нового кадра от главного цикла
+            self._new_frame_event.wait(timeout=0.1)
+            self._new_frame_event.clear()
+
+            frame = self._detection_frame
+            if frame is None:
+                continue
+
+            try:
+                detections = self._detector.detect_and_track(frame)
+                with self._detection_lock:
+                    self._latest_detections = detections
+            except Exception as e:
+                logger.error(f"Ошибка в потоке детекции: {e}")
+
+    # ════════════════════════════════════════════════════════
+    # Коррекция параллакса и boresight
+    # ════════════════════════════════════════════════════════
+
+    def _apply_parallax_correction(self, distance_m: float) -> tuple:
+        """
+        Коррекция параллакса камера-LRF.
+
+        Камера и дальномер смещены на baseline мм.
+        На ближних дистанциях это даёт угловую ошибку:
+            parallax_angle = atan(baseline / distance)
+
+        Args:
+            distance_m: Дистанция до цели (м)
+
+        Returns:
+            (yaw_correction_deg, pitch_correction_deg)
+        """
+        pcfg = self._cfg.motors.parallax
+        baseline_m = pcfg.baseline_mm / 1000.0
+
+        if distance_m <= 0:
+            return (0.0, 0.0)
+
+        angle_rad = math.atan(baseline_m / distance_m)
+        angle_deg = math.degrees(angle_rad)
+
+        # Направление коррекции
+        if pcfg.direction == "right":
+            return (-angle_deg, 0.0)  # LRF правее → камера смотрит левее
+        elif pcfg.direction == "left":
+            return (angle_deg, 0.0)
+        elif pcfg.direction == "above":
+            return (0.0, -angle_deg)
+        elif pcfg.direction == "below":
+            return (0.0, angle_deg)
+        return (0.0, 0.0)
+
+    def _interpolate_boresight(self, distance_m: float) -> tuple:
+        """
+        Линейная интерполяция boresight offsets по дистанции.
+
+        Таблица пристрелки из конфига: [[dist, yaw_mrad, pitch_mrad], ...]
+        Между точками — линейная интерполяция.
+        За пределами — экстраполяция по крайним точкам.
+
+        Args:
+            distance_m: Дистанция до цели (м)
+
+        Returns:
+            (yaw_offset_deg, pitch_offset_deg)
+        """
+        table = self._cfg.motors.boresight
+        if not table or len(table) < 2:
+            return (0.0, 0.0)
+
+        # Сортировка по дистанции
+        table = sorted(table, key=lambda x: x[0])
+
+        # За пределами таблицы — экстраполяция крайними значениями
+        if distance_m <= table[0][0]:
+            yaw_mrad = table[0][1]
+            pitch_mrad = table[0][2]
+        elif distance_m >= table[-1][0]:
+            yaw_mrad = table[-1][1]
+            pitch_mrad = table[-1][2]
+        else:
+            # Линейная интерполяция
+            for i in range(len(table) - 1):
+                d0, y0, p0 = table[i]
+                d1, y1, p1 = table[i + 1]
+                if d0 <= distance_m <= d1:
+                    t = (distance_m - d0) / (d1 - d0) if d1 != d0 else 0
+                    yaw_mrad = y0 + t * (y1 - y0)
+                    pitch_mrad = p0 + t * (p1 - p0)
+                    break
+            else:
+                yaw_mrad = 0.0
+                pitch_mrad = 0.0
+
+        # мрад → градусы
+        return (yaw_mrad * 0.001 * 180.0 / math.pi,
+                pitch_mrad * 0.001 * 180.0 / math.pi)
 
     # ════════════════════════════════════════════════════════
     # Утилиты
