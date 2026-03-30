@@ -110,7 +110,7 @@ class RangefinderConfig:
 @dataclass
 class DetectionConfig:
     """Параметры детекции YOLO."""
-    model_path: str = "models/yolov8n.hef"
+    model_path: str = "models/yolo26n.pt"
     confidence_threshold: float = 0.45
     nms_threshold: float = 0.5
     target_classes: List[int] = field(default_factory=lambda: [4])

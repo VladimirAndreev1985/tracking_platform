@@ -470,7 +470,7 @@ class YOLODetector:
         Постобработка сырого выхода YOLO (для Hailo).
 
         Формат выхода зависит от конкретной модели.
-        Здесь реализован типичный формат YOLOv8.
+        Здесь реализован типичный формат YOLO (anchor-free).
         """
         detections = []
 
@@ -482,7 +482,7 @@ class YOLODetector:
             if len(output_data.shape) == 3:
                 output_data = output_data[0]  # Убираем batch dimension
 
-            # YOLOv8 формат: (8400, 84) — 8400 якорей, 4 bbox + 80 классов
+            # YOLO формат: (8400, 84) — 8400 якорей, 4 bbox + 80 классов
             num_detections = output_data.shape[0]
             num_classes = output_data.shape[1] - 4
 

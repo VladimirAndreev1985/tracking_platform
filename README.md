@@ -8,7 +8,7 @@
 
 | Компонент | Модель | Назначение |
 |-----------|--------|------------|
-| Компьютер | Raspberry Pi 5 8 ГБ | Управление всей системой |
+| Компьютер | Raspberry Pi 5 16 ГБ | Управление всей системой |
 | AI-ускоритель | AI HAT+ 2 (Hailo-10H 40 TOPS) | Детекция объектов YOLO |
 | Камера | Arducam 5MP 1080p PTZ | Захват видео + оптический зум |
 | Дальномер | Meskernel TS1224 (UART) | Измерение дистанции лазером |
@@ -158,8 +158,8 @@ sudo reboot
 ### 4. Модель YOLO
 
 Скачайте модель и поместите в `models/`:
-- Для Hailo: `models/yolov8n.hef`
-- Для Ultralytics: `models/yolov8n.pt`
+- Для Hailo: `models/yolo26n.hef` (конвертировать через Hailo DFC)
+- Для Ultralytics: `models/yolo26n.pt` (скачается автоматически)
 
 ---
 
