@@ -279,6 +279,7 @@ class PlatformController:
         wp = self._ballistics.active_profile
         self._state.weapon_name = wp.short_name
         self._state.weapon_caliber = wp.cartridge
+        self._state.effective_range_m = float(wp.effective_range_m)
 
         self._predictor = TrajectoryPredictor(
             history_size=bal_cfg.prediction.history_points,
@@ -401,6 +402,9 @@ class PlatformController:
             # ── 7. Баллистика и предсказание ──
             if self._state.target_lock == TargetLockState.LOCKED:
                 self._update_ballistics()
+
+            # ── 7.5. Обновление боевой готовности ──
+            self._update_combat_readiness()
 
             # ── 8. HUD + отображение (30 FPS) ──
             if frame is not None and self._hud:
@@ -579,6 +583,8 @@ class PlatformController:
 
     def _update_tracking_state(self):
         """Обновить состояние трекинга в SharedState."""
+        from perception.detector import get_class_name, get_threat_priority
+
         locked = self._target_mgr.locked_track
 
         if locked:
@@ -587,10 +593,16 @@ class PlatformController:
             self._state.target_class_id = locked.class_id
             self._state.target_confidence = locked.confidence
             self._state.track_id = locked.track_id
+
+            # Тип цели и уровень угрозы
+            self._state.target_type_name = get_class_name(locked.class_id)
+            self._state.threat_level = get_threat_priority(locked.class_id)
         else:
             self._state.target_bbox = None
             self._state.target_center_px = None
             self._state.track_id = -1
+            self._state.target_type_name = ""
+            self._state.threat_level = 0
 
             if self._state.target_lock == TargetLockState.LOCKED:
                 self._state.target_lock = TargetLockState.LOST
@@ -706,6 +718,8 @@ class PlatformController:
         3. Логирование события стрельбы
         """
         self._firing = True
+        self._state.firing_active = True
+        self._state.burst_start_time = time.time()
         recoil_cfg = self._cfg.motors.recoil
         self._firing_boost_until = time.time() + recoil_cfg.boost_duration_sec
         logger.info("ОГОНЬ!")
@@ -717,7 +731,93 @@ class PlatformController:
             wp = self._ballistics.active_profile
             self._state.weapon_name = wp.short_name
             self._state.weapon_caliber = wp.cartridge
+            self._state.effective_range_m = float(wp.effective_range_m)
+            self._state.shots_fired = 0
             logger.info(f"Вооружение: {wp.short_name} ({wp.cartridge})")
+
+    # ════════════════════════════════════════════════════════
+    # Боевая готовность
+    # ════════════════════════════════════════════════════════
+
+    def _update_combat_readiness(self):
+        """
+        Обновить индикаторы боевой готовности в SharedState.
+
+        ГОТОВ К СТРЕЛЬБЕ = все 3 условия:
+          1. Цель захвачена (LOCKED)
+          2. Дистанция замерена (distance_valid)
+          3. Перехват возможен (intercept_possible)
+
+        В ЗОНЕ ПОРАЖЕНИЯ = дистанция < effective_range текущего оружия
+        """
+        s = self._state
+        now = time.time()
+
+        # Зона поражения
+        s.in_effective_range = (
+            s.distance_valid
+            and 0 < s.distance_m <= s.effective_range_m
+        )
+
+        # Готовность к стрельбе
+        s.ready_to_fire = (
+            s.target_lock == TargetLockState.LOCKED
+            and s.distance_valid
+            and s.intercept_possible
+            and s.in_effective_range
+        )
+
+        # Состояние стрельбы и отдачи
+        is_firing_now = (
+            self._joystick
+            and self._joystick.is_button_pressed(self._cfg.joystick.button_fire)
+        )
+        s.firing_active = bool(is_firing_now)
+        s.recoil_boost_active = now < self._firing_boost_until
+
+        # Если триггер отпущен — сбросить firing
+        if not is_firing_now:
+            self._firing = False
+
+        # Счётчик выстрелов (приблизительный по rate_of_fire)
+        if s.firing_active and s.burst_start_time > 0:
+            burst_duration = now - s.burst_start_time
+            wp = self._ballistics.active_profile if self._ballistics else None
+            if wp and wp.rate_of_fire_rpm > 0:
+                s.shots_fired = int(burst_duration * wp.rate_of_fire_rpm / 60.0)
+
+        # Вектор движения цели в пикселях (для стрелки на HUD)
+        if s.target_center_px and self._predictor and self._predictor.has_enough_data:
+            est = self._predictor.estimate
+            if est.is_valid and self._camera and s.distance_m > 0:
+                # Преобразуем скорость цели в пиксельное смещение
+                # Используем FOV камеры для масштабирования
+                fov_h = self._camera.fov_h
+                fov_v = self._camera.fov_v
+                w, h = self._camera.resolution
+                if fov_h > 0 and fov_v > 0:
+                    # Угловая скорость цели (°/с) → пиксели/с
+                    # Грубая оценка: speed * sin(heading) / distance → угловая скорость
+                    heading_rad = math.radians(est.heading_deg)
+                    angular_h = (est.speed_mps * math.sin(heading_rad)) / s.distance_m
+                    angular_v = (est.speed_mps * math.cos(heading_rad) * math.sin(math.radians(s.pitch_deg))) / s.distance_m
+                    # Рад/с → пиксели (масштаб: FOV = ширина кадра)
+                    dx = math.degrees(angular_h) / fov_h * w
+                    dy = math.degrees(angular_v) / fov_v * h
+                    # Ограничиваем длину вектора
+                    max_len = 80.0
+                    vec_len = math.sqrt(dx * dx + dy * dy)
+                    if vec_len > max_len:
+                        scale = max_len / vec_len
+                        dx *= scale
+                        dy *= scale
+                    s.target_velocity_px = (dx, dy)
+                else:
+                    s.target_velocity_px = None
+            else:
+                s.target_velocity_px = None
+        else:
+            s.target_velocity_px = None
 
     # ════════════════════════════════════════════════════════
     # Завершение

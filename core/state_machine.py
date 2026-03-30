@@ -117,6 +117,22 @@ class SharedState:
     weapon_caliber: str = ""       # Калибр (12.7×108 / 7.62×54R)
     bullet_energy_j: float = 0.0   # Энергия пули на дистанции (Дж)
     mach_at_target: float = 0.0    # Число Маха на дистанции
+    effective_range_m: float = 2000.0  # Эффективная дальность текущего оружия (м)
+
+    # ── Боевая готовность ──
+    ready_to_fire: bool = False    # ГОТОВ К СТРЕЛЬБЕ (цель захвачена + дист. замерена + перехват возможен)
+    in_effective_range: bool = False  # Цель в зоне поражения
+    firing_active: bool = False    # Триггер удерживается прямо сейчас
+    recoil_boost_active: bool = False  # Усиленные gains активны (гашение отдачи)
+    shots_fired: int = 0           # Счётчик выстрелов (приблизительный, по rate_of_fire)
+    burst_start_time: float = 0.0  # Время начала текущей очереди
+
+    # ── Тип цели ──
+    target_type_name: str = ""     # Русское название типа цели ("FPV-ДРОН", "БПЛА" и т.д.)
+    threat_level: int = 0          # Уровень угрозы (0-10, FPV=10, птица=1)
+
+    # ── Вектор движения цели ──
+    target_velocity_px: Optional[tuple] = None  # Вектор скорости цели в пикселях (dx, dy) для стрелки HUD
 
     # ── Системное ──
     loop_time_ms: float = 0.0     # Время итерации главного цикла
