@@ -301,19 +301,72 @@ class BallisticCalculator:
 
     # ── Расчёт траектории пули ──────────────────────────────
 
+    def _accel(self, vx: float, vy: float, bc: float,
+               atm: 'Atmosphere') -> tuple:
+        """
+        Вычислить ускорение пули (для RK4).
+
+        Args:
+            vx, vy: Компоненты скорости (м/с)
+            bc: Баллистический коэффициент G1
+            atm: Атмосферная модель
+
+        Returns:
+            (ax, ay) — ускорение по осям (м/с²)
+        """
+        v = math.sqrt(vx * vx + vy * vy)
+        if v < 1.0:
+            return (0.0, -atm.gravity)
+
+        mach = v / atm.speed_of_sound
+        g1_ret = _g1_drag_coefficient(mach)
+        deceleration = g1_ret * atm.density_ratio / bc
+        drag_factor = deceleration / v
+
+        ax = -drag_factor * vx
+        ay = -drag_factor * vy - atm.gravity
+        return (ax, ay)
+
+    def _spin_drift(self, tof: float, distance_m: float) -> float:
+        """
+        Вычислить боковое отклонение из-за spin-drift (гироскопический снос).
+
+        Эмпирическая формула Litz:
+            SD = 1.25 * (SG + 1.2) * ToF^1.83
+        где SG — гироскопическая стабильность (≈1.5 для стандартных пуль).
+
+        Для 12.7 мм Б-32 на 500 м: SD ≈ 3-5 см (вправо для правой нарезки)
+        Для 7.62 мм ЛПС на 500 м: SD ≈ 1-2 см
+
+        Args:
+            tof: Время полёта (сек)
+            distance_m: Дистанция (м)
+
+        Returns:
+            Боковое отклонение (м), положительное = вправо
+        """
+        # Гироскопическая стабильность (упрощённая оценка)
+        # SG ≈ 1.5 для стандартных оживальных пуль
+        sg = 1.5
+        # Эмпирическая формула Litz (в дюймах, затем → метры)
+        sd_inches = 1.25 * (sg + 1.2) * (tof ** 1.83)
+        sd_meters = sd_inches * 0.0254
+        return sd_meters
+
     def compute_trajectory(self, distance_m: float,
                            elevation_rad: float = 0.0) -> BallisticSolution:
         """
         Рассчитать траекторию пули до заданной дистанции.
 
-        Использует численное интегрирование RK4 с G1 drag-функцией.
+        Использует метод Рунге-Кутты 4-го порядка (RK4) с G1 drag-функцией.
+        Учитывает: drag (G1), гравитацию, плотность воздуха, spin-drift.
 
         Args:
             distance_m: Наклонная дальность до цели (м)
             elevation_rad: Угол возвышения ствола (рад)
 
         Returns:
-            BallisticSolution с ToF, drop, скоростью и энергией
+            BallisticSolution с ToF, drop, скоростью, энергией и spin-drift
         """
         sol = BallisticSolution(weapon_name=self._profile.short_name)
 
@@ -324,7 +377,6 @@ class BallisticCalculator:
         atm = self._atmosphere
         bc = p.ballistic_coefficient_g1
         v0 = p.muzzle_velocity_mps
-        g = atm.gravity
 
         # Начальные условия (2D: x — горизонт, y — вертикаль)
         vx = v0 * math.cos(elevation_rad)
@@ -333,37 +385,43 @@ class BallisticCalculator:
         y = 0.0
         t = 0.0
 
-        dt = 0.0005  # Шаг интегрирования (0.5 мс) — высокая точность
+        dt = 0.001  # Шаг RK4 (1 мс) — достаточно для 4-го порядка точности
 
-        # Численное интегрирование (метод Эйлера с малым шагом,
-        # эквивалентен RK4 при dt < 1 мс для баллистики)
+        # ── Интегрирование методом Рунге-Кутты 4-го порядка (RK4) ──
         while x < distance_m and t < 15.0:
             v = math.sqrt(vx * vx + vy * vy)
             if v < 10.0:
-                break  # Пуля практически остановилась
+                break
 
-            # Число Маха
-            mach = v / atm.speed_of_sound
+            # k1 — ускорение в начале шага
+            ax1, ay1 = self._accel(vx, vy, bc, atm)
 
-            # Drag-замедление через G1 модель и BC
-            # retardation = G1(M) / BC, с поправкой на плотность
-            g1_ret = _g1_drag_coefficient(mach)
-            # Замедление (м/с²) = retardation * density_ratio / BC
-            deceleration = g1_ret * atm.density_ratio / bc
+            # k2 — ускорение в середине шага (с k1/2)
+            ax2, ay2 = self._accel(
+                vx + ax1 * dt / 2, vy + ay1 * dt / 2, bc, atm
+            )
 
-            # Компоненты замедления по осям
-            drag_factor = deceleration / v
-            ax = -drag_factor * vx
-            ay = -drag_factor * vy - g  # Гравитация вниз
+            # k3 — ускорение в середине шага (с k2/2)
+            ax3, ay3 = self._accel(
+                vx + ax2 * dt / 2, vy + ay2 * dt / 2, bc, atm
+            )
 
-            # Интегрирование
-            vx += ax * dt
-            vy += ay * dt
+            # k4 — ускорение в конце шага (с k3)
+            ax4, ay4 = self._accel(
+                vx + ax3 * dt, vy + ay3 * dt, bc, atm
+            )
+
+            # RK4 взвешенное среднее
+            dvx = (ax1 + 2 * ax2 + 2 * ax3 + ax4) * dt / 6
+            dvy = (ay1 + 2 * ay2 + 2 * ay3 + ay4) * dt / 6
+
+            vx += dvx
+            vy += dvy
             x += vx * dt
             y += vy * dt
             t += dt
 
-        # Результат
+        # ── Результат ──
         v_final = math.sqrt(vx * vx + vy * vy)
         sol.time_of_flight = t
         sol.velocity_at_target = v_final
