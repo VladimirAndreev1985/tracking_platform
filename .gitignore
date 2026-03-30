@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# Логи
+logs/
+*.log
+
+# Модели (большие файлы)
+models/*.hef
+models/*.pt
+models/*.onnx
+models/*.engine
+
+# Калибровка
+calibration.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ОС
+.DS_Store
+Thumbs.db
