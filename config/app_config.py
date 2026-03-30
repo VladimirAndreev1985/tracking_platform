@@ -148,12 +148,13 @@ class JoystickConfig:
     deadzone: float = 0.08
     sensitivity_exponent: float = 2.0
     speed_multiplier: float = 1.0
-    button_mode_toggle: int = 5
-    button_estop: int = 1
-    button_center: int = 2
-    button_fire_rangefinder: int = 0
-    button_lock_target: int = 3
-    button_switch_weapon: int = 4
+    button_fire: int = 0              # ОГОНЬ (триггер)
+    button_estop: int = 1             # АВАРИЙНАЯ ОСТАНОВКА
+    button_lock_target: int = 2       # Захват / сброс цели
+    button_fire_rangefinder: int = 3  # Замер дальности
+    button_switch_weapon: int = 4     # КОРД ↔ ПКТ
+    button_mode_toggle: int = 5       # РУЧНОЙ ↔ АВТО
+    button_center: int = 6            # Возврат в центр
 
 
 @dataclass

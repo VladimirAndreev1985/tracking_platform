@@ -93,6 +93,10 @@ class PlatformController:
         self._smooth_pitch = 0.0
         self._smoothing = 0.3
 
+        # ── Состояние стрельбы ──
+        self._firing = False           # Триггер удерживается
+        self._firing_boost_until = 0.0 # Время окончания усиленных gains
+
         # ── Потоки ──
         # Поток детекции YOLO26
         self._detection_thread: threading.Thread = None
@@ -170,6 +174,9 @@ class PlatformController:
             )
             self._joystick.set_button_callback(
                 joy_cfg.button_switch_weapon, self._on_switch_weapon
+            )
+            self._joystick.set_button_callback(
+                joy_cfg.button_fire, self._on_fire
             )
         else:
             logger.error("    ОШИБКА: джойстик не найден!")
@@ -524,11 +531,17 @@ class PlatformController:
         grav_torque = v_cfg.gravity_compensation_nm * math.cos(v_rad)
 
         # ── Динамические gains ──
-        # TODO: при стрельбе переключать на kp_firing/kd_firing
-        h_kp = h_cfg.kp
-        h_kd = h_cfg.kd
-        v_kp = v_cfg.kp
-        v_kd = v_cfg.kd
+        # При стрельбе переключаемся на усиленные gains для гашения отдачи
+        if self._firing or time.time() < self._firing_boost_until:
+            h_kp = h_cfg.kp_firing
+            h_kd = h_cfg.kd_firing
+            v_kp = v_cfg.kp_firing
+            v_kd = v_cfg.kd_firing
+        else:
+            h_kp = h_cfg.kp
+            h_kd = h_cfg.kd
+            v_kp = v_cfg.kp
+            v_kd = v_cfg.kd
 
         # ── Отправка MIT Mode команд ──
         if self._motor_h and self._motor_h.is_enabled:
@@ -681,6 +694,21 @@ class PlatformController:
         """Захват / сброс цели."""
         if self._target_mgr:
             self._target_mgr.toggle_lock()
+
+    def _on_fire(self):
+        """
+        ОГОНЬ — триггер нажат.
+
+        При нажатии триггера:
+        1. Переключаемся на усиленные MIT Mode gains (kp_firing/kd_firing)
+           для мгновенного гашения отдачи
+        2. Gains остаются усиленными на boost_duration_sec после отпускания
+        3. Логирование события стрельбы
+        """
+        self._firing = True
+        recoil_cfg = self._cfg.motors.recoil
+        self._firing_boost_until = time.time() + recoil_cfg.boost_duration_sec
+        logger.info("ОГОНЬ!")
 
     def _on_switch_weapon(self):
         """Переключение профиля вооружения (КОРД ↔ ПКТ)."""
