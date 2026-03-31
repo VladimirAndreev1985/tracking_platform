@@ -134,6 +134,12 @@ class SharedState:
     # ── Вектор движения цели ──
     target_velocity_px: Optional[tuple] = None  # Вектор скорости цели в пикселях (dx, dy) для стрелки HUD
 
+    # ── PTZ-компенсация (раздельное наведение ствол/камера) ──
+    ptz_compensation_active: bool = False  # PTZ-компенсация активна (Arducam SDK доступен)
+    ptz_pan_deg: float = 0.0              # Текущий угол Pan PTZ-компенсации камеры (°)
+    ptz_tilt_deg: float = 0.0             # Текущий угол Tilt PTZ-компенсации камеры (°)
+    split_aiming_active: bool = False      # Раздельное наведение активно (ствол→lead, камера→цель)
+
     # ── Системное ──
     loop_time_ms: float = 0.0     # Время итерации главного цикла
     uptime_sec: float = 0.0       # Время работы

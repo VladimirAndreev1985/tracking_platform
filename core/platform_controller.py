@@ -465,13 +465,31 @@ class PlatformController:
         self._state.target_pitch_deg = self._target_pitch_deg
 
     def _process_auto_control(self, dt: float):
-        """Автоматическое слежение за целью."""
+        """
+        Автоматическое слежение за целью с раздельным наведением.
+
+        Архитектура раздельного наведения (split aiming):
+          1. PID-автотрекер удерживает цель в центре кадра
+             → вычисляет базовые углы платформы (куда смотрит камера)
+          2. Если есть баллистическое решение (lead point):
+             - Платформа (Cubemars) наводит СТВОЛ на lead point
+               (базовый угол + lead offset)
+             - Камера PTZ (Arducam) компенсирует разницу (-lead offset)
+               → цель остаётся в центре кадра
+             - YOLO продолжает видеть цель
+             - Дальномер продолжает бить в цель
+          3. Без баллистики — обычное слежение (ствол = камера = цель)
+        """
         locked = self._target_mgr.locked_track if self._target_mgr else None
 
         if locked is None:
             # Нет захваченной цели — переход в поиск
             self._state.target_lock = TargetLockState.SEARCHING
             self._autotracker.reset()
+            # Сбросить PTZ компенсацию
+            if self._camera and self._camera.has_ptz:
+                self._camera.reset_ptz()
+                self._state.split_aiming_active = False
             return
 
         # Обновляем параметры камеры (зум мог измениться)
@@ -481,21 +499,53 @@ class PlatformController:
                 self._camera.fov_h, self._camera.fov_v
             )
 
-        # Вычисляем скорости автослежения
+        # ── Шаг 1: PID вычисляет скорости для удержания цели в центре кадра ──
         tcx, tcy = locked.center
         yaw_speed, pitch_speed = self._autotracker.compute(tcx, tcy, dt)
 
-        # Применяем скорости
-        self._target_yaw_deg += yaw_speed * dt
-        self._target_pitch_deg += pitch_speed * dt
+        # Базовые углы (куда должна смотреть камера, чтобы цель была в центре)
+        base_yaw = self._target_yaw_deg + yaw_speed * dt
+        base_pitch = self._target_pitch_deg + pitch_speed * dt
 
-        # Ограничение
+        # ── Шаг 2: Раздельное наведение (если есть баллистика и PTZ) ──
+        lead_yaw_offset = 0.0
+        lead_pitch_offset = 0.0
+        split_active = False
+
+        if (self._state.intercept_possible
+                and self._camera and self._camera.has_ptz
+                and abs(self._state.lead_yaw_deg) + abs(self._state.lead_pitch_deg) > 0.01):
+            # Углы упреждения (lead) — разница между целью и точкой перехвата
+            lead_yaw_offset = self._state.lead_yaw_deg
+            lead_pitch_offset = self._state.lead_pitch_deg
+            split_active = True
+
+        # ── Шаг 3: Применяем углы ──
+        # Платформа (ствол): базовый угол + lead offset
+        self._target_yaw_deg = base_yaw + lead_yaw_offset
+        self._target_pitch_deg = base_pitch + lead_pitch_offset
+
+        # Ограничение углов платформы
         h_cfg = self._cfg.motors.horizontal
         v_cfg = self._cfg.motors.vertical
         self._target_yaw_deg = max(h_cfg.min_angle_deg,
                                     min(h_cfg.max_angle_deg, self._target_yaw_deg))
         self._target_pitch_deg = max(v_cfg.min_angle_deg,
                                       min(v_cfg.max_angle_deg, self._target_pitch_deg))
+
+        # Камера PTZ: компенсация (-lead offset), чтобы камера смотрела на цель
+        if split_active:
+            self._camera.set_ptz_compensation(-lead_yaw_offset, -lead_pitch_offset)
+            self._state.ptz_pan_deg = -lead_yaw_offset
+            self._state.ptz_tilt_deg = -lead_pitch_offset
+            self._state.split_aiming_active = True
+        else:
+            # Без баллистики — PTZ в нуле (ствол = камера)
+            if self._camera and self._camera.has_ptz:
+                self._camera.set_ptz_compensation(0.0, 0.0)
+            self._state.ptz_pan_deg = 0.0
+            self._state.ptz_tilt_deg = 0.0
+            self._state.split_aiming_active = False
 
         self._state.target_yaw_deg = self._target_yaw_deg
         self._state.target_pitch_deg = self._target_pitch_deg

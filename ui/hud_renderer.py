@@ -123,7 +123,7 @@ class HUDRenderer:
         if state.lead_point_px is not None and state.intercept_possible:
             self._draw_lead_point(frame, state)
 
-        # ── Левый верх: режим и статус захвата ──
+        # ── Левый верх: режим и статус захвата + PTZ ──
         self._draw_mode_status(frame, state)
 
         # ── Правый верх: огневые данные ──
@@ -311,9 +311,12 @@ class HUDRenderer:
         }
         lock_text, lock_color = lock_map.get(state.target_lock, ("---", self._c_info))
 
+        # Высота панели зависит от наличия PTZ
+        panel_h = 80 if state.split_aiming_active else 55
+
         # Фон панели
         overlay = frame.copy()
-        cv2.rectangle(overlay, (x - 5, y - 5), (x + 220, y + 55), self._c_bg, -1)
+        cv2.rectangle(overlay, (x - 5, y - 5), (x + 220, y + panel_h), self._c_bg, -1)
         cv2.addWeighted(overlay, self._cfg.overlay_alpha, frame,
                         1 - self._cfg.overlay_alpha, 0, frame)
 
@@ -328,6 +331,11 @@ class HUDRenderer:
 
         cv2.putText(frame, f"ЦЕЛЬ:  {lock_display}", (x, y + 45),
                     self._font, 0.50, lock_color, 1, cv2.LINE_AA)
+
+        # Индикатор раздельного наведения (PTZ-компенсация)
+        if state.split_aiming_active:
+            cv2.putText(frame, "PTZ: РАЗД.НАВЕД.", (x, y + 72),
+                        self._font, 0.40, self._c_lead, 1, cv2.LINE_AA)
 
     # ════════════════════════════════════════════════════════
     # Правый верх: огневые данные (минимум для решения)

@@ -507,6 +507,77 @@ class CameraDriver:
                 logger.debug(f"Picamera2 ScalerCrop: {e}")
 
     # ════════════════════════════════════════════════════════
+    # Управление Pan/Tilt (компенсация упреждения)
+    # ════════════════════════════════════════════════════════
+
+    # Текущие углы PTZ-компенсации
+    _ptz_pan_deg: float = 0.0
+    _ptz_tilt_deg: float = 0.0
+    _ptz_available: bool = False
+
+    @property
+    def has_ptz(self) -> bool:
+        """PTZ-компенсация доступна (Arducam SDK установлен)."""
+        return self._arducam_ptz is not None
+
+    @property
+    def ptz_pan_deg(self) -> float:
+        """Текущий угол Pan PTZ-компенсации (градусы)."""
+        return self._ptz_pan_deg
+
+    @property
+    def ptz_tilt_deg(self) -> float:
+        """Текущий угол Tilt PTZ-компенсации (градусы)."""
+        return self._ptz_tilt_deg
+
+    def set_ptz_compensation(self, pan_deg: float, tilt_deg: float):
+        """
+        Установить углы PTZ-компенсации камеры.
+
+        Используется для раздельного наведения:
+        - Платформа (Cubemars) наводит ствол на точку перехвата
+        - PTZ камеры (Arducam) компенсирует разницу, удерживая цель в центре кадра
+
+        Углы компенсации = -(lead_angle), чтобы камера "смотрела назад" на цель
+        когда ствол смотрит на lead point.
+
+        Arducam PTZ диапазон: примерно ±30° pan, ±30° tilt — более чем
+        достаточно для компенсации упреждения (обычно < 5°).
+
+        Args:
+            pan_deg: Горизонтальная компенсация (градусы, + = вправо)
+            tilt_deg: Вертикальная компенсация (градусы, + = вверх)
+        """
+        # Ограничение диапазона PTZ (защита от выхода за пределы)
+        max_pan = 25.0   # Безопасный предел (не весь диапазон, чтобы не упираться)
+        max_tilt = 25.0
+        pan_deg = max(-max_pan, min(max_pan, pan_deg))
+        tilt_deg = max(-max_tilt, min(max_tilt, tilt_deg))
+
+        self._ptz_pan_deg = pan_deg
+        self._ptz_tilt_deg = tilt_deg
+
+        if self._arducam_ptz is not None:
+            try:
+                # Arducam PTZ: углы в "шагах" (зависит от модели)
+                # Типичный диапазон: -180..+180 шагов ≈ ±30°
+                # Масштаб: ~6 шагов на градус
+                pan_steps = int(pan_deg * 6.0)
+                tilt_steps = int(tilt_deg * 6.0)
+                self._arducam_ptz.pan(pan_steps)
+                self._arducam_ptz.tilt(tilt_steps)
+            except Exception as e:
+                logger.warning(f"Arducam PTZ pan/tilt ошибка: {e}")
+        else:
+            # Без Arducam SDK — PTZ компенсация невозможна
+            # Углы сохраняются для отображения на HUD
+            pass
+
+    def reset_ptz(self):
+        """Сбросить PTZ-компенсацию в нулевое положение."""
+        self.set_ptz_compensation(0.0, 0.0)
+
+    # ════════════════════════════════════════════════════════
     # Утилиты: пиксели ↔ углы
     # ════════════════════════════════════════════════════════
 
