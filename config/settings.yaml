@@ -150,14 +150,20 @@ motors:
     mass_pkt_kg: 25.0
 
 # ────────────────────────────────────────────────────────────────
-# Камера Arducam 5MP PTZ (оптический зум, собственные сервоприводы)
+# Камера Arducam 5MP PTZ (CSI MIPI → разъём CAM0 на RPi5)
+#
+# Подключение: CSI шлейф (15-pin FPC) → CAM0 на Raspberry Pi 5
+# Бэкенд захвата: Picamera2 (libcamera) — основной
+#                 OpenCV — fallback для разработки на ПК
+# Управление зумом: Arducam Python SDK (I2C) — оптический
+#                   Picamera2 ScalerCrop — цифровой (если SDK нет)
 # ────────────────────────────────────────────────────────────────
 camera:
-  device_index: 0             # /dev/video0
+  device_index: 0             # CSI камера: 0=CAM0, 1=CAM1
   width: 1920
   height: 1080
   fps: 30
-  # Оптический зум (управляется I2C/UART камеры)
+  # Оптический зум (управляется через I2C, Arducam PTZ SDK)
   zoom_min: 1.0
   zoom_max: 5.0
   zoom_step: 0.1

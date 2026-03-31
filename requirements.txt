@@ -7,8 +7,14 @@
 PyYAML>=6.0                    # Парсинг YAML-конфигурации
 
 # ── Компьютерное зрение ──
-opencv-python>=4.8.0           # Захват видео, обработка изображений, HUD
+opencv-python>=4.8.0           # Обработка изображений, HUD-рендер
 numpy>=1.24.0                  # Массивы, математика
+
+# ── Камера CSI (Arducam PTZ через MIPI CSI на RPi5) ──
+picamera2>=0.3.12              # Основной бэкенд захвата (libcamera, CSI)
+                               # Предустановлен в Raspberry Pi OS Bookworm
+# Arducam-PTZ                  # Опционально: оптический зум через I2C
+                               # pip install Arducam-PTZ (если нужен аппаратный зум)
 
 # ── CAN-шина (моторы Cubemars AK80-64) ──
 python-can>=4.0.0              # MIT Mode протокол через CAN

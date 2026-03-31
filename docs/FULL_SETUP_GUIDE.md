@@ -337,19 +337,48 @@ minicom -D /dev/ttyAMA0 -b 115200
 
 ## 8. ПОДКЛЮЧЕНИЕ КАМЕРЫ И МОНИТОРА
 
-### 8.1 Arducam PTZ камера
+### 8.1 Arducam 5MP PTZ камера (CSI)
 
-1. Подключите камеру через **USB** в любой USB-порт RPi5
-2. Проверьте:
+Камера подключается через **CSI шлейф (MIPI)**, а **не через USB**.
+
+1. **Выключите** Raspberry Pi и отключите питание
+2. Подключите 15-пиновый FPC шлейф камеры в разъём **CAM0** на RPi5
+   - Контакты шлейфа должны смотреть **к плате** (синяя полоска наружу)
+   - Аккуратно поднимите защёлку разъёма, вставьте шлейф, опустите защёлку
+3. Включите RPi5 и проверьте:
+
 ```bash
-# Список видеоустройств
-v4l2-ctl --list-devices
-# Должно показать /dev/video0
+# Проверка что камера видна через libcamera
+libcamera-hello --list-cameras
+# Должно показать: Available cameras: 1
+#   0 : imx219 [2592x1944 10-bit RGGB] (/base/soc/i2c0mux/...)
 
-# Проверка разрешений
-v4l2-ctl -d /dev/video0 --list-formats-ext
-# Должно показать 1920x1080 @ 30fps
+# Тест захвата (5 секунд превью)
+libcamera-hello -t 5000
+
+# Тест записи кадра
+libcamera-still -o test.jpg
+# Должен создать файл test.jpg с фото
+
+# Проверка через Python (Picamera2)
+python3 -c "
+from picamera2 import Picamera2
+cam = Picamera2(0)
+config = cam.create_still_configuration()
+cam.configure(config)
+cam.start()
+import time; time.sleep(1)
+arr = cam.capture_array()
+print(f'Камера CSI: {arr.shape[1]}x{arr.shape[0]}')
+cam.close()
+"
 ```
+
+> **Для управления оптическим зумом** (PTZ) установите Arducam SDK:
+> ```bash
+> pip install Arducam-PTZ
+> ```
+> Без SDK зум будет цифровой (кроп через ISP Raspberry Pi).
 
 ### 8.2 HDMI монитор
 
